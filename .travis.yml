@@ -3,23 +3,30 @@ sudo: required
 language: go
 
 go:
-  - 1.11.x
+  - 1.14.x
 
 services:
   - docker
 
-install:
-  # gocov
-  - go get github.com/axw/gocov/gocov
-  # protobuf
-  - go get -v -d google.golang.org/grpc
-  - go get -v -d -t github.com/golang/protobuf/...
-  - curl -L https://github.com/google/protobuf/releases/download/v3.6.1/protoc-3.6.1-linux-x86_64.zip -o /tmp/protoc.zip
-  - unzip /tmp/protoc.zip -d "$HOME"/protoc
-  - mkdir -p "$HOME"/src && ln -s "$HOME"/protoc "$HOME"/src/protobuf
-
 env:
   - PATH=$HOME/protoc/bin:$PATH
 
-script:
-  - make unit-test integration
+before_script:
+- "curl -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/master/install.sh | sudo bash"
+
+jobs:
+  include:
+    - stage: Tests
+      name: Unit Tests
+      script:
+        - make unit-test
+    - name: Integration Tests
+      script:
+        - make integration
+    - stage: Compliance
+      name: Fossa Check
+      script:
+        - "fossa --option allow-unresolved:true"
+
+after_success:
+  - bash <(curl -s https://codecov.io/bash)

@@ -14,22 +14,26 @@
 package agentserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	_ "net/http/pprof" // Registers /debug/pprof endpoints in http.DefaultServeMux.
 	"os"
+	"strings"
 
-	"github.com/pressly/chi"
-	"github.com/uber-go/tally"
-
+	"github.com/uber/kraken/build-index/tagclient"
 	"github.com/uber/kraken/core"
+	"github.com/uber/kraken/lib/dockerdaemon"
 	"github.com/uber/kraken/lib/middleware"
 	"github.com/uber/kraken/lib/store"
 	"github.com/uber/kraken/lib/torrent/scheduler"
 	"github.com/uber/kraken/utils/handler"
 	"github.com/uber/kraken/utils/httputil"
+
+	"github.com/pressly/chi"
+	"github.com/uber-go/tally"
 )
 
 // Config defines Server configuration.
@@ -37,10 +41,12 @@ type Config struct{}
 
 // Server defines the agent HTTP server.
 type Server struct {
-	config Config
-	stats  tally.Scope
-	cads   *store.CADownloadStore
-	sched  scheduler.ReloadableScheduler
+	config    Config
+	stats     tally.Scope
+	cads      *store.CADownloadStore
+	sched     scheduler.ReloadableScheduler
+	tags      tagclient.Client
+	dockerCli dockerdaemon.DockerClient
 }
 
 // New creates a new Server.
@@ -48,12 +54,15 @@ func New(
 	config Config,
 	stats tally.Scope,
 	cads *store.CADownloadStore,
-	sched scheduler.ReloadableScheduler) *Server {
+	sched scheduler.ReloadableScheduler,
+	tags tagclient.Client,
+	dockerCli dockerdaemon.DockerClient) *Server {
 
 	stats = stats.Tagged(map[string]string{
 		"module": "agentserver",
 	})
-	return &Server{config, stats, cads, sched}
+
+	return &Server{config, stats, cads, sched, tags, dockerCli}
 }
 
 // Handler returns the HTTP handler.
@@ -65,9 +74,14 @@ func (s *Server) Handler() http.Handler {
 
 	r.Get("/health", handler.Wrap(s.healthHandler))
 
-	r.Get("/namespace/:namespace/blobs/:digest", handler.Wrap(s.downloadBlobHandler))
+	r.Get("/tags/{tag}", handler.Wrap(s.getTagHandler))
 
-	r.Delete("/blobs/:digest", handler.Wrap(s.deleteBlobHandler))
+	r.Get("/namespace/{namespace}/blobs/{digest}", handler.Wrap(s.downloadBlobHandler))
+
+	r.Delete("/blobs/{digest}", handler.Wrap(s.deleteBlobHandler))
+
+	// Preheat/preload endpoints.
+	r.Get("/preload/tags/{tag}", handler.Wrap(s.preloadTagHandler))
 
 	// Dangerous endpoint for running experiments.
 	r.Patch("/x/config/scheduler", handler.Wrap(s.patchSchedulerConfigHandler))
@@ -78,6 +92,23 @@ func (s *Server) Handler() http.Handler {
 	r.Mount("/", http.DefaultServeMux)
 
 	return r
+}
+
+// getTagHandler proxies get tag requests to the build-index.
+func (s *Server) getTagHandler(w http.ResponseWriter, r *http.Request) error {
+	tag, err := httputil.ParseParam(r, "tag")
+	if err != nil {
+		return err
+	}
+	d, err := s.tags.Get(tag)
+	if err != nil {
+		if err == tagclient.ErrTagNotFound {
+			return handler.ErrorStatus(http.StatusNotFound)
+		}
+		return handler.Errorf("get tag: %s", err)
+	}
+	io.WriteString(w, d.String())
+	return nil
 }
 
 // downloadBlobHandler downloads a blob through p2p.
@@ -120,6 +151,25 @@ func (s *Server) deleteBlobHandler(w http.ResponseWriter, r *http.Request) error
 	}
 	if err := s.sched.RemoveTorrent(d); err != nil {
 		return handler.Errorf("remove torrent: %s", err)
+	}
+	return nil
+}
+
+// preloadTagHandler triggers docker daemon to download specified docker image.
+func (s *Server) preloadTagHandler(w http.ResponseWriter, r *http.Request) error {
+	tag, err := httputil.ParseParam(r, "tag")
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(tag, ":")
+	if len(parts) != 2 {
+		return handler.Errorf("failed to parse docker image tag")
+	}
+	repo, tag := parts[0], parts[1]
+	if err := s.dockerCli.PullImage(
+		context.Background(), repo, tag); err != nil {
+
+		return handler.Errorf("trigger docker pull: %s", err)
 	}
 	return nil
 }

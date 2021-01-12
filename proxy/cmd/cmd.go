@@ -14,6 +14,11 @@
 package cmd
 
 import (
+	"flag"
+
+	"fmt"
+	"net/http"
+
 	"github.com/uber/kraken/build-index/tagclient"
 	"github.com/uber/kraken/lib/dockerregistry/transfer"
 	"github.com/uber/kraken/lib/healthcheck"
@@ -22,60 +27,108 @@ import (
 	"github.com/uber/kraken/metrics"
 	"github.com/uber/kraken/nginx"
 	"github.com/uber/kraken/origin/blobclient"
+	"github.com/uber/kraken/proxy/proxyserver"
 	"github.com/uber/kraken/proxy/registryoverride"
 	"github.com/uber/kraken/utils/configutil"
+	"github.com/uber/kraken/utils/flagutil"
 	"github.com/uber/kraken/utils/log"
 
-	"github.com/spf13/cobra"
+	"github.com/uber-go/tally"
+	"go.uber.org/zap"
 )
 
-var (
-	ports         []int
-	configFile    string
-	krakenCluster string
-
-	rootCmd = &cobra.Command{
-		Short: "kraken-proxy handles uploads and direct downloads",
-		Run: func(rootCmd *cobra.Command, args []string) {
-			run()
-		},
-	}
-)
-
-func init() {
-	rootCmd.PersistentFlags().IntSliceVar(
-		&ports, "port", []int{}, "port to listen on (may specify multiple)")
-	rootCmd.PersistentFlags().StringVarP(
-		&configFile, "config", "", "", "configuration file path")
-	rootCmd.PersistentFlags().StringVarP(
-		&krakenCluster, "cluster", "", "", "cluster name (e.g. prod01-zone1)")
+// Flags defines proxy CLI flags.
+type Flags struct {
+	Ports         flagutil.Ints
+	ServerPort    int
+	ConfigFile    string
+	KrakenCluster string
+	SecretsFile   string
 }
 
-func Execute() {
-	rootCmd.Execute()
+// ParseFlags parses proxy CLI flags.
+func ParseFlags() *Flags {
+	var flags Flags
+	flag.Var(
+		&flags.Ports, "port", "port to listen on (may specify multiple)")
+	flag.IntVar(
+		&flags.ServerPort, "server-port", 0, "http server port to listen on")
+	flag.StringVar(
+		&flags.ConfigFile, "config", "", "configuration file path")
+	flag.StringVar(
+		&flags.KrakenCluster, "cluster", "", "cluster name (e.g. prod01-zone1)")
+	flag.StringVar(
+		&flags.SecretsFile, "secrets", "", "path to a secrets YAML file to load into configuration")
+	flag.Parse()
+	return &flags
 }
 
-func run() {
-	if len(ports) == 0 {
+type options struct {
+	config  *Config
+	metrics tally.Scope
+	logger  *zap.Logger
+}
+
+// Option defines an optional Run parameter.
+type Option func(*options)
+
+// WithConfig ignores config/secrets flags and directly uses the provided config
+// struct.
+func WithConfig(c Config) Option {
+	return func(o *options) { o.config = &c }
+}
+
+// WithMetrics ignores metrics config and directly uses the provided tally scope.
+func WithMetrics(s tally.Scope) Option {
+	return func(o *options) { o.metrics = s }
+}
+
+// WithLogger ignores logging config and directly uses the provided logger.
+func WithLogger(l *zap.Logger) Option {
+	return func(o *options) { o.logger = l }
+}
+
+// Run runs the proxy.
+func Run(flags *Flags, opts ...Option) {
+	if len(flags.Ports) == 0 {
 		panic("must specify a port")
 	}
 
+	var overrides options
+	for _, o := range opts {
+		o(&overrides)
+	}
+
 	var config Config
-	if err := configutil.Load(configFile, &config); err != nil {
-		panic(err)
+	if overrides.config != nil {
+		config = *overrides.config
+	} else {
+		if err := configutil.Load(flags.ConfigFile, &config); err != nil {
+			panic(err)
+		}
+		if flags.SecretsFile != "" {
+			if err := configutil.Load(flags.SecretsFile, &config); err != nil {
+				panic(err)
+			}
+		}
 	}
 
-	log.ConfigureLogger(config.ZapLogging)
-
-	if len(ports) == 0 {
-		log.Fatal("Must specify at least one -port")
+	if overrides.logger != nil {
+		log.SetGlobalLogger(overrides.logger.Sugar())
+	} else {
+		zlog := log.ConfigureLogger(config.ZapLogging)
+		defer zlog.Sync()
 	}
 
-	stats, closer, err := metrics.New(config.Metrics, krakenCluster)
-	if err != nil {
-		log.Fatalf("Failed to init metrics: %s", err)
+	stats := overrides.metrics
+	if stats == nil {
+		s, closer, err := metrics.New(config.Metrics, flags.KrakenCluster)
+		if err != nil {
+			log.Fatalf("Failed to init metrics: %s", err)
+		}
+		stats = s
+		defer closer.Close()
 	}
-	defer closer.Close()
 
 	go metrics.EmitVersion(stats)
 
@@ -106,6 +159,16 @@ func run() {
 
 	transferer := transfer.NewReadWriteTransferer(stats, tagClient, originCluster, cas)
 
+	// Open preheat function only if server-port was defined.
+	if flags.ServerPort != 0 {
+		server := proxyserver.New(stats, originCluster)
+		addr := fmt.Sprintf(":%d", flags.ServerPort)
+		log.Infof("Starting http server on %s", addr)
+		go func() {
+			log.Fatal(http.ListenAndServe(addr, server.Handler()))
+		}()
+	}
+
 	registry, err := config.Registry.Build(config.Registry.ReadWriteParameters(transferer, cas, stats))
 	if err != nil {
 		log.Fatalf("Error creating registry: %s", err)
@@ -122,7 +185,7 @@ func run() {
 
 	log.Info("Starting nginx...")
 	log.Fatal(nginx.Run(config.Nginx, map[string]interface{}{
-		"ports": ports,
+		"ports": flags.Ports,
 		"registry_server": nginx.GetServer(
 			config.Registry.Docker.HTTP.Net, config.Registry.Docker.HTTP.Addr),
 		"registry_override_server": nginx.GetServer(

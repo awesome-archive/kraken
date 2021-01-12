@@ -14,15 +14,16 @@
 package store
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
-	"github.com/uber/kraken/core"
 	"github.com/stretchr/testify/require"
 	"github.com/uber-go/tally"
+	"github.com/uber/kraken/core"
 )
 
 func TestCAStoreInitVolumes(t *testing.T) {
@@ -145,11 +146,18 @@ func TestCAStoreCreateUploadFileAndMoveToCache(t *testing.T) {
 	require.NoError(err)
 
 	src := core.DigestFixture().Hex()
-	dst := core.DigestFixture().Hex()
 
 	require.NoError(s.CreateUploadFile(src, 100))
 	_, err = os.Stat(path.Join(config.UploadDir, src))
 	require.NoError(err)
+
+	f, err := s.uploadStore.newFileOp().GetFileReader(src)
+	require.NoError(err)
+	defer f.Close()
+	digester := core.NewDigester()
+	digest, err := digester.FromReader(f)
+	require.NoError(err)
+	dst := digest.Hex()
 
 	err = s.MoveUploadFileToCache(src, dst)
 	require.NoError(err)
@@ -157,6 +165,37 @@ func TestCAStoreCreateUploadFileAndMoveToCache(t *testing.T) {
 	require.True(os.IsNotExist(err))
 	_, err = os.Stat(path.Join(config.CacheDir, dst[:2], dst[2:4], dst))
 	require.NoError(err)
+}
+
+func TestCAStoreCreateUploadFileAndMoveToCacheFailure(t *testing.T) {
+	require := require.New(t)
+
+	config, cleanup := CAStoreConfigFixture()
+	defer cleanup()
+
+	s, err := NewCAStore(config, tally.NoopScope)
+	require.NoError(err)
+
+	src := core.DigestFixture().Hex()
+
+	require.NoError(s.CreateUploadFile(src, 100))
+	_, err = os.Stat(path.Join(config.UploadDir, src))
+	require.NoError(err)
+
+	f, err := s.uploadStore.newFileOp().GetFileReader(src)
+	require.NoError(err)
+	defer f.Close()
+	digester := core.NewDigester()
+	digest, err := digester.FromReader(f)
+	require.NoError(err)
+
+	dst := core.DigestFixture().Hex()
+	err = s.MoveUploadFileToCache(src, dst)
+	require.EqualError(err, fmt.Sprintf("verify digest: computed digest sha256:%s doesn't match expected value sha256:%s", digest.Hex(), dst))
+	_, err = os.Stat(path.Join(config.UploadDir, src[:2], src[2:4], src))
+	require.True(os.IsNotExist(err))
+	_, err = os.Stat(path.Join(config.CacheDir, dst[:2], dst[2:4], dst))
+	require.True(os.IsNotExist(err))
 }
 
 func TestCAStoreCreateCacheFile(t *testing.T) {

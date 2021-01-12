@@ -29,7 +29,13 @@ from threading import Thread
 import requests
 
 from uploader import Uploader
-from utils import format_insecure_curl, tls_opts
+from utils import (
+    PortReservation,
+    dev_tag,
+    find_free_port,
+    format_insecure_curl,
+    tls_opts,
+)
 
 
 def get_docker_bridge():
@@ -94,10 +100,10 @@ class HealthCheck(object):
 
 class DockerContainer(object):
 
-    def __init__(self, name, image, command=None, ports=None, volumes=None):
+    def __init__(self, name, image, command=None, ports=None, volumes=None, user=None):
         self.name = name
         self.image = image
-        
+
         self.command = []
         if command:
             self.command = command
@@ -106,13 +112,15 @@ class DockerContainer(object):
         if ports:
             for i, o in ports.iteritems():
                 self.ports.extend(['-p', '{o}:{i}'.format(i=i, o=o)])
-        
+
         self.volumes = []
         if volumes:
             for o, i in volumes.iteritems():
                 bind = i['bind']
                 mode = i['mode']
-                self.volumes.extend(['-v', '{o}:{bind}:{mode}'.format(o=o, bind=bind, mode=mode)]) 
+                self.volumes.extend(['-v', '{o}:{bind}:{mode}'.format(o=o, bind=bind, mode=mode)])
+
+        self.user = ['-u', user] if user else []
 
     def run(self):
         cmd = [
@@ -122,6 +130,7 @@ class DockerContainer(object):
         ]
         cmd.extend(self.ports)
         cmd.extend(self.volumes)
+        cmd.extend(self.user)
         cmd.append(self.image)
         cmd.extend(self.command)
         assert subprocess.call(cmd) == 0
@@ -140,7 +149,7 @@ class DockerContainer(object):
 
 
 def new_docker_container(name, image, command=None, environment=None, ports=None,
-                         volumes=None, health_check=None):
+                         volumes=None, health_check=None, user=None):
     """
     Creates and starts a detached Docker container. If health_check is specified,
     ensures the container is healthy before returning.
@@ -154,7 +163,8 @@ def new_docker_container(name, image, command=None, environment=None, ports=None
         image=image,
         command=command,
         ports=ports,
-        volumes=volumes)
+        volumes=volumes,
+        user=user)
     c.run()
     print 'Starting container {}'.format(c.name)
     try:
@@ -166,14 +176,6 @@ def new_docker_container(name, image, command=None, environment=None, ports=None
         print_logs(c)
         raise
     return c
-
-
-def find_free_port():
-    s = socket()
-    s.bind(('', 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def populate_config_template(kname, filename, **kwargs):
@@ -203,7 +205,7 @@ def init_cache(cname):
     return cache
 
 
-def create_volumes(kname, cname):
+def create_volumes(kname, cname, local_cache=True):
     """
     Creates volume bindings for Kraken name `kname` and container name `cname`.
     """
@@ -218,13 +220,14 @@ def create_volumes(kname, cname):
         'mode': 'ro',
     }
 
-    # Mount local cache. Allows components to simulate unavailability whilst
-    # retaining their state on disk.
-    cache = init_cache(cname)
-    volumes[cache] = {
-        'bind': '/var/cache/kraken/kraken-{kname}/'.format(kname=kname),
-        'mode': 'rw',
-    }
+    if local_cache:
+        # Mount local cache. Allows components to simulate unavailability whilst
+        # retaining their state on disk.
+        cache = init_cache(cname)
+        volumes[cache] = {
+            'bind': '/var/cache/kraken/kraken-{kname}/'.format(kname=kname),
+            'mode': 'rw',
+        }
 
     return volumes
 
@@ -270,30 +273,10 @@ class Component(object):
             print 'Teardown {name} failed: {e}'.format(name=self.container.name, e=e)
 
 
-class Redis(Component):
-
-    def __init__(self, zone):
-        self.zone = zone
-        self.port = find_free_port()
-        self.start()
-
-    def new_container(self):
-        return new_docker_container(
-            name='kraken-redis-{zone}'.format(zone=self.zone),
-            image='redis:latest',
-            ports={6379: self.port},
-            health_check=HealthCheck('redis-cli ping'))
-
-    @property
-    def addr(self):
-        return '{}:{}'.format(get_docker_bridge(), self.port)
-
-
 class Tracker(Component):
 
-    def __init__(self, zone, redis, origin_cluster):
+    def __init__(self, zone, origin_cluster):
         self.zone = zone
-        self.redis = redis
         self.origin_cluster = origin_cluster
         self.port = find_free_port()
         self.config_file = 'test-{zone}.yaml'.format(zone=zone)
@@ -302,7 +285,6 @@ class Tracker(Component):
         populate_config_template(
             'tracker',
             self.config_file,
-            redis=self.redis.addr,
             origins=yaml_list([o.addr for o in self.origin_cluster.origins]))
 
         self.volumes = create_volumes('tracker', self.name)
@@ -312,7 +294,7 @@ class Tracker(Component):
     def new_container(self):
         return new_docker_container(
             name=self.name,
-            image='kraken-tracker:dev',
+            image=dev_tag('kraken-tracker'),
             environment={},
             ports={self.port: self.port},
             volumes=self.volumes,
@@ -334,8 +316,12 @@ class Origin(Component):
         def __init__(self, name):
             self.name = name
             self.hostname = get_docker_bridge()
-            self.port = find_free_port()
+            self.port_rez = PortReservation()
             self.peer_port = find_free_port()
+
+        @property
+        def port(self):
+            return self.port_rez.get()
 
         @property
         def addr(self):
@@ -359,9 +345,10 @@ class Origin(Component):
         self.start()
 
     def new_container(self):
+        self.instance.port_rez.release()
         return new_docker_container(
             name=self.name,
-            image='kraken-origin:dev',
+            image=dev_tag('kraken-origin'),
             volumes=self.volumes,
             environment={},
             ports={
@@ -409,7 +396,7 @@ class OriginCluster(object):
 
 class Agent(Component):
 
-    def __init__(self, zone, id, tracker, build_indexes):
+    def __init__(self, zone, id, tracker, build_indexes, with_docker_socket=False):
         self.zone = zone
         self.id = id
         self.tracker = tracker
@@ -419,6 +406,7 @@ class Agent(Component):
         self.port = find_free_port()
         self.config_file = 'test-{zone}.yaml'.format(zone=zone)
         self.name = 'kraken-agent-{id}-{zone}'.format(id=id, zone=zone)
+        self.with_docker_socket = with_docker_socket
 
         populate_config_template(
             'agent',
@@ -426,14 +414,27 @@ class Agent(Component):
             trackers=yaml_list([self.tracker.addr]),
             build_indexes=yaml_list([bi.addr for bi in self.build_indexes]))
 
-        self.volumes = create_volumes('agent', self.name)
+        if self.with_docker_socket:
+            # In aditional to the need to mount docker socket, also avoid using
+            # local cache volume, otherwise the process would run as root and
+            # create local cache files that's hard to clean outside of the
+            # container.
+            self.volumes = create_volumes('agent', self.name, local_cache=False)
+            self.volumes['/var/run/docker.sock'] = {
+                'bind': '/var/run/docker.sock',
+                'mode': 'rw',
+            }
+        else:
+            self.volumes = create_volumes('agent', self.name)
 
         self.start()
 
     def new_container(self):
+        # Root user is needed for accessing docker socket.
+        user = 'root' if self.with_docker_socket else None
         return new_docker_container(
             name=self.name,
-            image='kraken-agent:dev',
+            image=dev_tag('kraken-agent'),
             environment={},
             ports={
                 self.torrent_client_port: self.torrent_client_port,
@@ -449,7 +450,8 @@ class Agent(Component):
                 '--agent-server-port={port}'.format(port=self.port),
                 '--agent-registry-port={port}'.format(port=self.registry_port),
             ],
-            health_check=HealthCheck('curl localhost:{port}/health'.format(port=self.port)))
+            health_check=HealthCheck('curl localhost:{port}/health'.format(port=self.port)),
+            user=user)
 
     @property
     def registry(self):
@@ -467,6 +469,14 @@ class Agent(Component):
     def pull(self, image):
         return pull(self.registry, image)
 
+    def preload(self, image):
+        url = 'http://127.0.0.1:{port}/preload/tags/{image}'.format(
+            port=self.port, image=urllib.quote(image, safe=''))
+        s = requests.session()
+        s.keep_alive = False
+        res = s.get(url, stream=True, timeout=60)
+        res.raise_for_status()
+
 
 class AgentFactory(object):
 
@@ -476,8 +486,8 @@ class AgentFactory(object):
         self.build_indexes = build_indexes
 
     @contextmanager
-    def create(self, n=1):
-        agents = [Agent(self.zone, i, self.tracker, self.build_indexes) for i in range(n)]
+    def create(self, n=1, with_docker_socket=False):
+        agents = [Agent(self.zone, i, self.tracker, self.build_indexes, with_docker_socket) for i in range(n)]
         try:
             if len(agents) == 1:
                 yield agents[0]
@@ -511,7 +521,7 @@ class Proxy(Component):
     def new_container(self):
         return new_docker_container(
             name=self.name,
-            image='kraken-proxy:dev',
+            image=dev_tag('kraken-proxy'),
             ports={self.port: self.port},
             environment={},
             command=[
@@ -566,7 +576,11 @@ class BuildIndex(Component):
         def __init__(self, name):
             self.name = name
             self.hostname = get_docker_bridge()
-            self.port = find_free_port()
+            self.port_rez = PortReservation()
+
+        @property
+        def port(self):
+            return self.port_rez.get()
 
         @property
         def addr(self):
@@ -595,18 +609,20 @@ class BuildIndex(Component):
         self.start()
 
     def new_container(self):
+        self.instance.port_rez.release()
         return new_docker_container(
             name=self.name,
-            image='kraken-build-index:dev',
+            image=dev_tag('kraken-build-index'),
             ports={self.port: self.port},
             environment={},
             command=[
                 '/usr/bin/kraken-build-index',
                 '--config=/etc/kraken/config/build-index/{config}'.format(config=self.config_file),
-                '--port={port}'.format(port=self.instance.port),
+                '--port={port}'.format(port=self.port),
             ],
             volumes=self.volumes,
-            health_check=HealthCheck(format_insecure_curl('https://localhost:{}/health'.format(self.instance.port))))
+            health_check=HealthCheck(format_insecure_curl(
+                'https://localhost:{}/health'.format(self.port))))
 
     @property
     def port(self):
@@ -622,7 +638,7 @@ class BuildIndex(Component):
                 repo=urllib.quote(repo, safe=''))
         res = requests.get(url, **tls_opts())
         res.raise_for_status()
-        return res.json()
+        return res.json()['result']
 
 
 class TestFS(Component):
@@ -635,7 +651,7 @@ class TestFS(Component):
     def new_container(self):
         return new_docker_container(
             name='kraken-testfs-{zone}'.format(zone=self.zone),
-            image='kraken-testfs:dev',
+            image=dev_tag('kraken-testfs'),
             ports={self.port: self.port},
             command=[
                 '/usr/bin/kraken-testfs',
@@ -680,9 +696,7 @@ class Cluster(object):
             for name in origin_instances
         ])
 
-        self.redis = self._register(Redis(zone))
-
-        self.tracker = self._register(Tracker(zone, self.redis, self.origin_cluster))
+        self.tracker = self._register(Tracker(zone, self.origin_cluster))
 
         self.build_indexes = []
         for name in local_build_index_instances:

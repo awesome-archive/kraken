@@ -28,6 +28,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// How long to wait for the Ticker goroutine to fire / not fire. Fairly large
+// to prevent flakey tests.
+const _tickerTimeout = time.Second
+
 type mockEvents struct {
 	tick chan struct{}
 }
@@ -41,7 +45,7 @@ func (e *mockEvents) AnnounceTick() { e.tick <- struct{}{} }
 func (e *mockEvents) expectTick(t *testing.T) {
 	select {
 	case <-e.tick:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(_tickerTimeout):
 		require.FailNow(t, "Tick timed out")
 	}
 }
@@ -50,7 +54,7 @@ func (e *mockEvents) expectNoTick(t *testing.T) {
 	select {
 	case <-e.tick:
 		require.FailNow(t, "Unexpected tick")
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(_tickerTimeout):
 	}
 }
 
@@ -93,7 +97,7 @@ func TestAnnouncerAnnounceUpdatesInterval(t *testing.T) {
 	interval := 10 * time.Second
 	peers := []*core.PeerInfo{core.PeerInfoFixture()}
 
-	mocks.client.EXPECT().Announce(d, hash, false, announceclient.V1).Return(peers, interval, nil)
+	mocks.client.EXPECT().Announce(d, hash, false, announceclient.V2).Return(peers, interval, nil)
 
 	result, err := announcer.Announce(d, hash, false)
 	require.NoError(err)
@@ -125,7 +129,7 @@ func TestAnnouncerAnnounceErr(t *testing.T) {
 	hash := core.InfoHashFixture()
 	err := errors.New("some error")
 
-	mocks.client.EXPECT().Announce(d, hash, false, announceclient.V1).Return(nil, time.Duration(0), err)
+	mocks.client.EXPECT().Announce(d, hash, false, announceclient.V2).Return(nil, time.Duration(0), err)
 
 	_, aErr := announcer.Announce(d, hash, false)
 	require.Equal(err, aErr)

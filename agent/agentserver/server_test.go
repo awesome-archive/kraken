@@ -15,21 +15,99 @@ package agentserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net/url"
 	"testing"
 	"time"
 
+	"github.com/uber/kraken/agent/agentclient"
+	"github.com/uber/kraken/build-index/tagclient"
 	"github.com/uber/kraken/core"
 	"github.com/uber/kraken/lib/store"
 	"github.com/uber/kraken/lib/torrent/scheduler"
 	"github.com/uber/kraken/lib/torrent/scheduler/connstate"
+	mocktagclient "github.com/uber/kraken/mocks/build-index/tagclient"
+	mockdockerdaemon "github.com/uber/kraken/mocks/lib/dockerdaemon"
+	mockscheduler "github.com/uber/kraken/mocks/lib/torrent/scheduler"
 	"github.com/uber/kraken/utils/httputil"
+	"github.com/uber/kraken/utils/testutil"
 
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
+	"github.com/uber-go/tally"
 )
+
+type serverMocks struct {
+	cads      *store.CADownloadStore
+	sched     *mockscheduler.MockReloadableScheduler
+	tags      *mocktagclient.MockClient
+	dockerCli *mockdockerdaemon.MockDockerClient
+	cleanup   *testutil.Cleanup
+}
+
+func newServerMocks(t *testing.T) (*serverMocks, func()) {
+	var cleanup testutil.Cleanup
+
+	cads, c := store.CADownloadStoreFixture()
+	cleanup.Add(c)
+
+	ctrl := gomock.NewController(t)
+	cleanup.Add(ctrl.Finish)
+
+	sched := mockscheduler.NewMockReloadableScheduler(ctrl)
+
+	tags := mocktagclient.NewMockClient(ctrl)
+
+	dockerCli := mockdockerdaemon.NewMockDockerClient(ctrl)
+
+	return &serverMocks{cads, sched, tags, dockerCli, &cleanup}, cleanup.Run
+}
+
+func (m *serverMocks) startServer() string {
+	s := New(Config{}, tally.NoopScope, m.cads, m.sched, m.tags, m.dockerCli)
+	addr, stop := testutil.StartServer(s.Handler())
+	m.cleanup.Add(stop)
+	return addr
+}
+
+func TestGetTag(t *testing.T) {
+	require := require.New(t)
+
+	mocks, cleanup := newServerMocks(t)
+	defer cleanup()
+
+	tag := core.TagFixture()
+	d := core.DigestFixture()
+
+	mocks.tags.EXPECT().Get(tag).Return(d, nil)
+
+	c := agentclient.New(mocks.startServer())
+
+	result, err := c.GetTag(tag)
+	require.NoError(err)
+	require.Equal(d, result)
+}
+
+func TestGetTagNotFound(t *testing.T) {
+	require := require.New(t)
+
+	mocks, cleanup := newServerMocks(t)
+	defer cleanup()
+
+	tag := core.TagFixture()
+
+	mocks.tags.EXPECT().Get(tag).Return(core.Digest{}, tagclient.ErrTagNotFound)
+
+	c := agentclient.New(mocks.startServer())
+
+	_, err := c.GetTag(tag)
+	require.Error(err)
+	require.Equal(agentclient.ErrTagNotFound, err)
+}
 
 func TestDownload(t *testing.T) {
 	require := require.New(t)
@@ -46,7 +124,7 @@ func TestDownload(t *testing.T) {
 		})
 
 	addr := mocks.startServer()
-	c := NewClient(addr)
+	c := agentclient.New(addr)
 
 	r, err := c.Download(namespace, blob.Digest)
 	require.NoError(err)
@@ -67,7 +145,7 @@ func TestDownloadNotFound(t *testing.T) {
 	mocks.sched.EXPECT().Download(namespace, blob.Digest).Return(scheduler.ErrTorrentNotFound)
 
 	addr := mocks.startServer()
-	c := NewClient(addr)
+	c := agentclient.New(addr)
 
 	_, err := c.Download(namespace, blob.Digest)
 	require.Error(err)
@@ -86,7 +164,7 @@ func TestDownloadUnknownError(t *testing.T) {
 	mocks.sched.EXPECT().Download(namespace, blob.Digest).Return(fmt.Errorf("test error"))
 
 	addr := mocks.startServer()
-	c := NewClient(addr)
+	c := agentclient.New(addr)
 
 	_, err := c.Download(namespace, blob.Digest)
 	require.Error(err)
@@ -176,9 +254,25 @@ func TestDeleteBlobHandler(t *testing.T) {
 	d := core.DigestFixture()
 
 	addr := mocks.startServer()
-	c := NewClient(addr)
 
 	mocks.sched.EXPECT().RemoveTorrent(d).Return(nil)
 
-	require.NoError(c.Delete(d))
+	_, err := httputil.Delete(fmt.Sprintf("http://%s/blobs/%s", addr, d))
+	require.NoError(err)
+}
+
+func TestPreloadHandler(t *testing.T) {
+	require := require.New(t)
+
+	mocks, cleanup := newServerMocks(t)
+	defer cleanup()
+
+	addr := mocks.startServer()
+
+	tag := url.PathEscape("repo1:tag1")
+
+	mocks.dockerCli.EXPECT().PullImage(context.Background(), "repo1", "tag1").Return(nil)
+
+	_, err := httputil.Get(fmt.Sprintf("http://%s/preload/tags/%s", addr, tag))
+	require.NoError(err)
 }

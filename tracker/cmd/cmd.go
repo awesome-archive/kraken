@@ -14,8 +14,8 @@
 package cmd
 
 import (
-	"github.com/andres-erbsen/clock"
-	"github.com/spf13/cobra"
+	"flag"
+
 	"github.com/uber/kraken/lib/healthcheck"
 	"github.com/uber/kraken/lib/upstream"
 	"github.com/uber/kraken/metrics"
@@ -27,53 +27,105 @@ import (
 	"github.com/uber/kraken/tracker/trackerserver"
 	"github.com/uber/kraken/utils/configutil"
 	"github.com/uber/kraken/utils/log"
+
+	"github.com/andres-erbsen/clock"
+	"github.com/uber-go/tally"
+	"go.uber.org/zap"
 )
 
-var (
-	port          int
-	configFile    string
-	krakenCluster string
+// Flags define tracker CLI flags.
+type Flags struct {
+	Port          int
+	ConfigFile    string
+	KrakenCluster string
+	SecretsFile   string
+}
 
-	rootCmd = &cobra.Command{
-		Short: "kraken-tracker keeps track of all the peers and their data in the p2p network.",
-		Run: func(rootCmd *cobra.Command, args []string) {
-			run()
-		},
+// ParseFlags parses tracker CLI flags.
+func ParseFlags() *Flags {
+	var flags Flags
+	flag.IntVar(
+		&flags.Port, "port", 0, "port to listen on")
+	flag.StringVar(
+		&flags.ConfigFile, "config", "", "configuration file path")
+	flag.StringVar(
+		&flags.KrakenCluster, "cluster", "", "cluster name (e.g. prod01-zone1)")
+	flag.StringVar(
+		&flags.SecretsFile, "secrets", "", "path to a secrets YAML file to load into configuration")
+	flag.Parse()
+	return &flags
+}
+
+type options struct {
+	config  *Config
+	metrics tally.Scope
+	logger  *zap.Logger
+}
+
+// Option defines an optional Run parameter.
+type Option func(*options)
+
+// WithConfig ignores config/secrets flags and directly uses the provided config
+// struct.
+func WithConfig(c Config) Option {
+	return func(o *options) { o.config = &c }
+}
+
+// WithMetrics ignores metrics config and directly uses the provided tally scope.
+func WithMetrics(s tally.Scope) Option {
+	return func(o *options) { o.metrics = s }
+}
+
+// WithLogger ignores logging config and directly uses the provided logger.
+func WithLogger(l *zap.Logger) Option {
+	return func(o *options) { o.logger = l }
+}
+
+// Run runs the tracker.
+func Run(flags *Flags, opts ...Option) {
+	var overrides options
+	for _, o := range opts {
+		o(&overrides)
 	}
-)
 
-func init() {
-	rootCmd.PersistentFlags().IntVarP(
-		&port, "port", "", 0, "port to listen on")
-	rootCmd.PersistentFlags().StringVarP(
-		&configFile, "config", "", "", "configuration file path")
-	rootCmd.PersistentFlags().StringVarP(
-		&krakenCluster, "cluster", "", "", "cluster name (e.g. prod01-zone1)")
-}
-
-func Execute() {
-	rootCmd.Execute()
-}
-
-func run() {
 	var config Config
-	if err := configutil.Load(configFile, &config); err != nil {
-		panic(err)
+	if overrides.config != nil {
+		config = *overrides.config
+	} else {
+		if err := configutil.Load(flags.ConfigFile, &config); err != nil {
+			panic(err)
+		}
+		if flags.SecretsFile != "" {
+			if err := configutil.Load(flags.SecretsFile, &config); err != nil {
+				panic(err)
+			}
+		}
 	}
-	log.ConfigureLogger(config.ZapLogging)
 
-	stats, closer, err := metrics.New(config.Metrics, krakenCluster)
-	if err != nil {
-		log.Fatalf("Failed to init metrics: %s", err)
+	if overrides.logger != nil {
+		log.SetGlobalLogger(overrides.logger.Sugar())
+	} else {
+		zlog := log.ConfigureLogger(config.ZapLogging)
+		defer zlog.Sync()
 	}
-	defer closer.Close()
+
+	stats := overrides.metrics
+	if stats == nil {
+		s, closer, err := metrics.New(config.Metrics, flags.KrakenCluster)
+		if err != nil {
+			log.Fatalf("Failed to init metrics: %s", err)
+		}
+		stats = s
+		defer closer.Close()
+	}
 
 	go metrics.EmitVersion(stats)
 
-	peerStore, err := peerstore.NewRedisStore(config.PeerStore.Redis, clock.New())
+	peerStore, err := peerstore.New(config.PeerStore)
 	if err != nil {
 		log.Fatalf("Could not create PeerStore: %s", err)
 	}
+	defer peerStore.Close()
 
 	tls, err := config.TLS.BuildClient()
 	if err != nil {
@@ -104,7 +156,7 @@ func run() {
 
 	log.Info("Starting nginx...")
 	log.Fatal(nginx.Run(config.Nginx, map[string]interface{}{
-		"port": port,
+		"port": flags.Port,
 		"server": nginx.GetServer(
 			config.TrackerServer.Listener.Net, config.TrackerServer.Listener.Addr)},
 		nginx.WithTLS(config.TLS)))

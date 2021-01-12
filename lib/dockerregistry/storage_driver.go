@@ -14,15 +14,17 @@
 package dockerregistry
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/uber/kraken/lib/dockerregistry/transfer"
 	"github.com/uber/kraken/lib/store"
 	"github.com/uber/kraken/utils/log"
 
-	"github.com/docker/distribution/context"
-	storagedriver "github.com/docker/distribution/registry/storage/driver"
+	"github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/factory"
 	"github.com/uber-go/tally"
 )
@@ -48,16 +50,9 @@ import (
 // 						hashstates/<algorithm>/<offset>
 //			-> blobs/<algorithm>
 //				<split directory content addressable storage>
-//
 
-const (
-	// Name of storage driver
-	Name            = "kraken"
-	retries         = 3
-	downloadTimeout = 120     //seconds
-	readtimeout     = 15 * 60 //seconds
-	writetimeout    = 15 * 60 //seconds
-)
+// Name of storage driver.
+const Name = "kraken"
 
 func init() {
 	factory.Register(Name, &krakenStorageDriverFactory{})
@@ -72,6 +67,18 @@ func (e InvalidRequestError) Error() string {
 	return fmt.Sprintf("invalid request: %s", e.path)
 }
 
+func toDriverError(err error, path string) error {
+	if errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, transfer.ErrBlobNotFound) ||
+		errors.Is(err, transfer.ErrTagNotFound) {
+		return driver.PathNotFoundError{
+			DriverName: Name,
+			Path:       path,
+		}
+	}
+	return err
+}
+
 type krakenStorageDriverFactory struct{}
 
 func getParam(params map[string]interface{}, name string) interface{} {
@@ -83,7 +90,7 @@ func getParam(params map[string]interface{}, name string) interface{} {
 }
 
 func (factory *krakenStorageDriverFactory) Create(
-	params map[string]interface{}) (storagedriver.StorageDriver, error) {
+	params map[string]interface{}) (driver.StorageDriver, error) {
 
 	// Common parameters.
 	constructor := getParam(params, "constructor").(string)
@@ -154,42 +161,53 @@ func (d *KrakenStorageDriver) Name() string {
 
 // GetContent returns content in the path
 // sample path: /docker/registry/v2/repositories/external/ubuntu/_layers/sha256/a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4/link
-func (d *KrakenStorageDriver) GetContent(ctx context.Context, path string) (data []byte, err error) {
+func (d *KrakenStorageDriver) GetContent(ctx context.Context, path string) ([]byte, error) {
 	log.Debugf("(*KrakenStorageDriver).GetContent %s", path)
 	pathType, pathSubType, err := ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
 
+	var data []byte
 	switch pathType {
 	case _manifests:
-		return d.manifests.getDigest(path, pathSubType)
+		data, err = d.manifests.getDigest(path, pathSubType)
 	case _uploads:
-		return d.uploads.getContent(path, pathSubType)
+		data, err = d.uploads.getContent(path, pathSubType)
 	case _layers:
-		return d.blobs.getDigest(path)
+		data, err = d.blobs.getDigest(path)
 	case _blobs:
-		return d.blobs.getContent(ctx, path)
+		data, err = d.blobs.getContent(ctx, path)
+	default:
+		return nil, InvalidRequestError{path}
 	}
-	return nil, InvalidRequestError{path}
+	if err != nil {
+		return nil, toDriverError(err, path)
+	}
+	return data, nil
 }
 
 // Reader returns a reader of path at offset
-func (d *KrakenStorageDriver) Reader(ctx context.Context, path string, offset int64) (reader io.ReadCloser, err error) {
+func (d *KrakenStorageDriver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
 	log.Debugf("(*KrakenStorageDriver).Reader %s", path)
 	pathType, pathSubType, err := ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
 
+	var reader io.ReadCloser
 	switch pathType {
 	case _uploads:
-		return d.uploads.reader(path, pathSubType, offset)
+		reader, err = d.uploads.reader(path, pathSubType, offset)
 	case _blobs:
-		return d.blobs.reader(ctx, path, offset)
+		reader, err = d.blobs.reader(ctx, path, offset)
 	default:
 		return nil, InvalidRequestError{path}
 	}
+	if err != nil {
+		return nil, toDriverError(err, path)
+	}
+	return reader, nil
 }
 
 // PutContent writes content to path
@@ -202,21 +220,25 @@ func (d *KrakenStorageDriver) PutContent(ctx context.Context, path string, conte
 
 	switch pathType {
 	case _manifests:
-		return d.manifests.putContent(path, pathSubType)
+		err = d.manifests.putContent(path, pathSubType)
 	case _uploads:
-		return d.uploads.putContent(path, pathSubType, content)
+		err = d.uploads.putContent(path, pathSubType, content)
 	case _layers:
 		// noop
 		return nil
 	case _blobs:
-		return d.uploads.putBlobContent(path, content)
+		err = d.uploads.putBlobContent(path, content)
 	default:
 		return InvalidRequestError{path}
 	}
+	if err != nil {
+		return toDriverError(err, path)
+	}
+	return nil
 }
 
 // Writer returns a writer of path
-func (d *KrakenStorageDriver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
+func (d *KrakenStorageDriver) Writer(ctx context.Context, path string, append bool) (driver.FileWriter, error) {
 	log.Debugf("(*KrakenStorageDriver).Writer %s", path)
 	pathType, pathSubType, err := ParsePath(path)
 	if err != nil {
@@ -227,7 +249,7 @@ func (d *KrakenStorageDriver) Writer(ctx context.Context, path string, append bo
 	case _uploads:
 		w, err := d.uploads.writer(path, pathSubType)
 		if err != nil {
-			return nil, err
+			return nil, toDriverError(err, path)
 		}
 		if append {
 			if _, err := w.Seek(0, io.SeekEnd); err != nil {
@@ -241,23 +263,28 @@ func (d *KrakenStorageDriver) Writer(ctx context.Context, path string, append bo
 }
 
 // Stat returns fileinfo of path
-func (d *KrakenStorageDriver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
+func (d *KrakenStorageDriver) Stat(ctx context.Context, path string) (driver.FileInfo, error) {
 	log.Debugf("(*KrakenStorageDriver).Stat %s", path)
 	pathType, _, err := ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
 
+	var info driver.FileInfo
 	switch pathType {
 	case _uploads:
-		return d.uploads.stat(path)
+		info, err = d.uploads.stat(path)
 	case _blobs:
-		return d.blobs.stat(ctx, path)
+		info, err = d.blobs.stat(ctx, path)
 	case _manifests:
-		return d.manifests.stat(path)
+		info, err = d.manifests.stat(path)
 	default:
 		return nil, InvalidRequestError{path}
 	}
+	if err != nil {
+		return nil, toDriverError(err, path)
+	}
+	return info, nil
 }
 
 // List returns a list of content given path
@@ -268,14 +295,19 @@ func (d *KrakenStorageDriver) List(ctx context.Context, path string) ([]string, 
 		return nil, err
 	}
 
+	var l []string
 	switch pathType {
 	case _uploads:
-		return d.uploads.list(path, pathSubType)
+		l, err = d.uploads.list(path, pathSubType)
 	case _manifests:
-		return d.manifests.list(path)
+		l, err = d.manifests.list(path)
 	default:
 		return nil, InvalidRequestError{path}
 	}
+	if err != nil {
+		return nil, toDriverError(err, path)
+	}
+	return l, nil
 }
 
 // Move moves sourcePath to destPath
@@ -288,17 +320,21 @@ func (d *KrakenStorageDriver) Move(ctx context.Context, sourcePath string, destP
 
 	switch pathType {
 	case _uploads:
-		return d.uploads.move(sourcePath, destPath)
+		err = d.uploads.move(sourcePath, destPath)
 	default:
 		return InvalidRequestError{sourcePath + " to " + destPath}
 	}
+	if err != nil {
+		return toDriverError(err, sourcePath)
+	}
+	return nil
 }
 
 // Delete deletes path
 func (d *KrakenStorageDriver) Delete(ctx context.Context, path string) error {
 	log.Debugf("(*KrakenStorageDriver).Delete %s", path)
-	return storagedriver.PathNotFoundError{
-		DriverName: "p2p",
+	return driver.PathNotFoundError{
+		DriverName: Name,
 		Path:       path,
 	}
 }
@@ -307,4 +343,9 @@ func (d *KrakenStorageDriver) Delete(ctx context.Context, path string) error {
 func (d *KrakenStorageDriver) URLFor(ctx context.Context, path string, options map[string]interface{}) (string, error) {
 	log.Debugf("(*KrakenStorageDriver).URLFor %s", path)
 	return "", fmt.Errorf("Not implemented")
+}
+
+// Walk is not implemented.
+func (d *KrakenStorageDriver) Walk(ctx context.Context, path string, f driver.WalkFn) error {
+	return errors.New("walk not implemented")
 }

@@ -31,6 +31,16 @@ import (
 	"github.com/uber/kraken/utils/handler"
 )
 
+var retryableCodes = map[int]struct{}{
+	http.StatusTooManyRequests:    {},
+	http.StatusBadGateway:         {},
+	http.StatusServiceUnavailable: {},
+	http.StatusGatewayTimeout:     {},
+}
+
+// RoundTripper is an alias of the http.RoundTripper for mocking purposes.
+type RoundTripper = http.RoundTripper
+
 // StatusError occurs if an HTTP response has an unexpected status code.
 type StatusError struct {
 	Method       string
@@ -95,6 +105,18 @@ func IsForbidden(err error) bool {
 	return IsStatus(err, http.StatusForbidden)
 }
 
+func isRetryable(code int) bool {
+	_, ok := retryableCodes[code]
+	return ok
+}
+
+// IsRetryable returns true if the statis code indicates that the request is
+// retryable.
+func IsRetryable(err error) bool {
+	statusErr, ok := err.(StatusError)
+	return ok && isRetryable(statusErr.Status)
+}
+
 // NetworkError occurs on any Send error which occurred while trying to send
 // the HTTP request, e.g. the given host is unresponsive.
 type NetworkError struct {
@@ -125,6 +147,17 @@ type sendOptions struct {
 	// parts of the url. For example, url.Scheme can be changed from
 	// http to https.
 	url *url.URL
+
+	// This is not a valid http option. HTTP fallback is added to allow
+	// easier migration from http to https.
+	// In go1.11 and go1.12, the responses returned when http request is
+	// sent to https server are different in the fallback mode:
+	// go1.11 returns a network error whereas go1.12 returns BadRequest.
+	// This causes TestTLSClientBadAuth to fail because the test checks
+	// retry error.
+	// This flag is added to allow disabling http fallback in unit tests.
+	// NOTE: it does not impact how it runs in production.
+	httpFallbackDisabled bool
 }
 
 // SendOption allows overriding defaults for the Send function.
@@ -165,8 +198,8 @@ func SendRedirect(redirect func(req *http.Request, via []*http.Request) error) S
 }
 
 type retryOptions struct {
-	backoff backoff.BackOff
-	extraCodes   map[int]bool
+	backoff    backoff.BackOff
+	extraCodes map[int]bool
 }
 
 // RetryOption allows overriding defaults for the SendRetry option.
@@ -201,6 +234,13 @@ func SendRetry(options ...RetryOption) SendOption {
 		o(&retry)
 	}
 	return func(o *sendOptions) { o.retry = retry }
+}
+
+// DisableHTTPFallback disables http fallback when https request fails.
+func DisableHTTPFallback() SendOption {
+	return func(o *sendOptions) {
+		o.httpFallbackDisabled = true
+	}
 }
 
 // SendTLS sets the transport with TLS config for the HTTP client.
@@ -238,18 +278,19 @@ func Send(method, rawurl string, options ...SendOption) (*http.Response, error) 
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %s", err)
 	}
-	opts := sendOptions{
-		body:          nil,
-		timeout:       60 * time.Second,
-		acceptedCodes: map[int]bool{http.StatusOK: true},
-		headers:       map[string]string{},
-		retry:         retryOptions{backoff: &backoff.StopBackOff{}},
-		transport:     nil, // Use HTTP default.
-		ctx:           context.Background(),
-		url:           u,
+	opts := &sendOptions{
+		body:                 nil,
+		timeout:              60 * time.Second,
+		acceptedCodes:        map[int]bool{http.StatusOK: true},
+		headers:              map[string]string{},
+		retry:                retryOptions{backoff: &backoff.StopBackOff{}},
+		transport:            nil, // Use HTTP default.
+		ctx:                  context.Background(),
+		url:                  u,
+		httpFallbackDisabled: false,
 	}
 	for _, o := range options {
-		o(&opts)
+		o(opts)
 	}
 
 	req, err := newRequest(method, opts)
@@ -257,7 +298,7 @@ func Send(method, rawurl string, options ...SendOption) (*http.Response, error) 
 		return nil, err
 	}
 
-	client := http.Client{
+	client := &http.Client{
 		Timeout:       opts.timeout,
 		CheckRedirect: opts.redirect,
 		Transport:     opts.transport,
@@ -269,17 +310,20 @@ func Send(method, rawurl string, options ...SendOption) (*http.Response, error) 
 		// Retry without tls. During migration there would be a time when the
 		// component receiving the tls request does not serve https response.
 		// TODO (@evelynl): disable retry after tls migration.
-		if err != nil && req.URL.Scheme == "https" {
-			var httpReq *http.Request
-			httpReq, err = newRequest(method, opts)
+		if err != nil && req.URL.Scheme == "https" && !opts.httpFallbackDisabled {
+			originalErr := err
+			resp, err = fallbackToHTTP(client, method, opts)
 			if err != nil {
-				return nil, err
+				// Sometimes the request fails for a reason unrelated to https.
+				// To keep this reason visible, we always include the original
+				// error.
+				err = fmt.Errorf(
+					"failed to fallback https to http, original https error: %s,\n"+
+						"fallback http error: %s", originalErr, err)
 			}
-			httpReq.URL.Scheme = "http"
-			resp, err = client.Do(httpReq)
 		}
 		if err != nil ||
-			(resp.StatusCode >= 500 && !opts.acceptedCodes[resp.StatusCode]) ||
+			(isRetryable(resp.StatusCode) && !opts.acceptedCodes[resp.StatusCode]) ||
 			(opts.retry.extraCodes[resp.StatusCode]) {
 			d := opts.retry.backoff.NextBackOff()
 			if d == backoff.Stop {
@@ -390,7 +434,7 @@ func ParseDigest(r *http.Request, name string) (core.Digest, error) {
 	return d, nil
 }
 
-func newRequest(method string, opts sendOptions) (*http.Request, error) {
+func newRequest(method string, opts *sendOptions) (*http.Request, error) {
 	req, err := http.NewRequest(method, opts.url.String(), opts.body)
 	if err != nil {
 		return nil, fmt.Errorf("new request: %s", err)
@@ -403,6 +447,18 @@ func newRequest(method string, opts sendOptions) (*http.Request, error) {
 		req.Header.Set(key, val)
 	}
 	return req, nil
+}
+
+func fallbackToHTTP(
+	client *http.Client, method string, opts *sendOptions) (*http.Response, error) {
+
+	req, err := newRequest(method, opts)
+	if err != nil {
+		return nil, err
+	}
+	req.URL.Scheme = "http"
+
+	return client.Do(req)
 }
 
 func min(a, b time.Duration) time.Duration {

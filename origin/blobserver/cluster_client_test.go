@@ -52,8 +52,8 @@ func TestClusterClientResilientToUnavailableMasters(t *testing.T) {
 
 	// Register dummy master addresses so Provide can still create a Client for
 	// unavailable masters.
-	cp.register(master2, blobclient.New("http://localhost:0"))
-	cp.register(master3, blobclient.New("http://localhost:0"))
+	cp.register(master2, blobclient.New("localhost:0"))
+	cp.register(master3, blobclient.New("localhost:0"))
 
 	r := blobclient.NewClientResolver(cp, hostlist.Fixture(master1))
 	cc := blobclient.NewClusterClient(r)
@@ -91,9 +91,9 @@ func TestClusterClientReturnsErrorOnNoAvailability(t *testing.T) {
 	require := require.New(t)
 
 	cp := newTestClientProvider()
-	cp.register(master1, blobclient.New("http://localhost:0"))
-	cp.register(master2, blobclient.New("http://localhost:0"))
-	cp.register(master3, blobclient.New("http://localhost:0"))
+	cp.register(master1, blobclient.New("localhost:0"))
+	cp.register(master2, blobclient.New("localhost:0"))
+	cp.register(master3, blobclient.New("localhost:0"))
 
 	r := blobclient.NewClientResolver(cp, hostlist.Fixture(master1))
 	cc := blobclient.NewClusterClient(r)
@@ -168,6 +168,29 @@ func TestPollSkipsOriginOnNetworkErrors(t *testing.T) {
 	require.NoError(blobclient.Poll(mockResolver, b, blob.Digest, func(c blobclient.Client) error {
 		return c.DownloadBlob(namespace, blob.Digest, nil)
 	}))
+}
+
+func TestPollSkipsOriginOnRetryableError(t *testing.T) {
+	require := require.New(t)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	blob := core.NewBlobFixture()
+	namespace := core.TagFixture()
+
+	mockResolver := mockblobclient.NewMockClientResolver(ctrl)
+	cc := blobclient.NewClusterClient(mockResolver)
+
+	mockClient1 := mockblobclient.NewMockClient(ctrl)
+	mockClient2 := mockblobclient.NewMockClient(ctrl)
+
+	mockResolver.EXPECT().Resolve(blob.Digest).Return([]blobclient.Client{mockClient1, mockClient2}, nil)
+
+	mockClient1.EXPECT().UploadBlob(namespace, blob.Digest, nil).Return(httputil.StatusError{Status: 503})
+	mockClient2.EXPECT().UploadBlob(namespace, blob.Digest, nil).Return(nil)
+
+	require.NoError(cc.UploadBlob(namespace, blob.Digest, nil))
 }
 
 func TestClusterClientReturnsErrorOnNoAvailableOrigins(t *testing.T) {

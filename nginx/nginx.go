@@ -37,6 +37,8 @@ var _clientCABundle = path.Join(_genDir, "ca.crt")
 
 // Config defines nginx configuration.
 type Config struct {
+	Binary string `yaml:"binary"`
+
 	Root bool `yaml:"root"`
 
 	// Name defines the default nginx template for each component.
@@ -46,19 +48,51 @@ type Config struct {
 	TemplatePath string `yaml:"template_path"`
 
 	CacheDir string `yaml:"cache_dir"`
-	LogDir   string `yaml:"log_dir"`
+
+	LogDir string `yaml:"log_dir"`
+
+	// Optional log path overrides.
+	StdoutLogPath string `yaml:"stdout_log_path"`
+	AccessLogPath string `yaml:"access_log_path"`
+	ErrorLogPath  string `yaml:"error_log_path"`
 
 	tls httputil.TLSConfig
 }
 
+func (c *Config) applyDefaults() error {
+	if c.Binary == "" {
+		c.Binary = "/usr/sbin/nginx"
+	}
+	if c.StdoutLogPath == "" {
+		if c.LogDir == "" {
+			return errors.New("one of log_dir or stdout_log_path must be set")
+		}
+		c.StdoutLogPath = filepath.Join(c.LogDir, "nginx-stdout.log")
+	}
+	if c.AccessLogPath == "" {
+		if c.LogDir == "" {
+			return errors.New("one of log_dir or access_log_path must be set")
+		}
+		c.AccessLogPath = filepath.Join(c.LogDir, "nginx-access.log")
+	}
+	if c.ErrorLogPath == "" {
+		if c.LogDir == "" {
+			return errors.New("one of log_dir or error_log_path must be set")
+		}
+		c.ErrorLogPath = filepath.Join(c.LogDir, "nginx-error.log")
+	}
+	return nil
+}
+
 func (c *Config) inject(params map[string]interface{}) error {
-	for _, s := range []string{"cache_dir", "log_dir"} {
+	for _, s := range []string{"cache_dir", "access_log_path", "error_log_path"} {
 		if _, ok := params[s]; ok {
 			return fmt.Errorf("invalid params: %s is reserved", s)
 		}
 	}
 	params["cache_dir"] = c.CacheDir
-	params["log_dir"] = c.LogDir
+	params["access_log_path"] = c.AccessLogPath
+	params["error_log_path"] = c.ErrorLogPath
 	return nil
 }
 
@@ -121,18 +155,24 @@ func WithTLS(tls httputil.TLSConfig) Option {
 
 // Run injects params into an nginx configuration template and runs it.
 func Run(config Config, params map[string]interface{}, opts ...Option) error {
+	if err := config.applyDefaults(); err != nil {
+		return fmt.Errorf("invalid config: %s", err)
+	}
 	if config.Name == "" && config.TemplatePath == "" {
 		return errors.New("invalid config: name or template_path required")
 	}
 	if config.CacheDir == "" {
 		return errors.New("invalid config: cache_dir required")
 	}
-	if config.LogDir == "" {
-		return errors.New("invalid config: log_dir required")
-	}
 	for _, opt := range opts {
 		opt(&config)
 	}
+
+	// Create root directory for generated files for nginx.
+	if err := os.MkdirAll(_genDir, 0775); err != nil {
+		return err
+	}
+
 	if config.tls.Server.Disabled {
 		log.Warn("Server TLS is disabled")
 	} else {
@@ -145,6 +185,16 @@ func Run(config Config, params map[string]interface{}, opts ...Option) error {
 				return fmt.Errorf("invalid TLS config: %s", err)
 			}
 		}
+
+		// Concat all ca files into bundle.
+		cabundle, err := os.Create(_clientCABundle)
+		if err != nil {
+			return fmt.Errorf("create cabundle: %s", err)
+		}
+		if err := config.tls.WriteCABundle(cabundle); err != nil {
+			return fmt.Errorf("write cabundle: %s", err)
+		}
+		cabundle.Close()
 	}
 
 	if err := os.MkdirAll(config.CacheDir, 0775); err != nil {
@@ -160,29 +210,17 @@ func Run(config Config, params map[string]interface{}, opts ...Option) error {
 		return fmt.Errorf("build nginx config: %s", err)
 	}
 
-	if err := os.MkdirAll(_genDir, 0775); err != nil {
-		return err
-	}
 	conf := filepath.Join(_genDir, config.Name)
 	if err := ioutil.WriteFile(conf, src, 0755); err != nil {
 		return fmt.Errorf("write src: %s", err)
 	}
-	cabundle, err := os.Create(_clientCABundle)
-	if err != nil {
-		return fmt.Errorf("create cabundle: %s", err)
-	}
-	if err := config.tls.WriteCABundle(cabundle); err != nil {
-		return fmt.Errorf("write cabundle: %s", err)
-	}
-	cabundle.Close()
 
-	stdoutLog := path.Join(config.LogDir, "nginx-stdout.log")
-	stdout, err := os.OpenFile(stdoutLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	stdout, err := os.OpenFile(config.StdoutLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("open stdout log: %s", err)
 	}
 
-	args := []string{"/usr/sbin/nginx", "-g", "daemon off;", "-c", conf}
+	args := []string{config.Binary, "-g", "daemon off;", "-c", conf}
 	if config.Root {
 		args = append([]string{"sudo"}, args...)
 	}

@@ -131,36 +131,36 @@ func (s *Server) Handler() http.Handler {
 
 	r.Get("/health", handler.Wrap(s.healthCheckHandler))
 
-	r.Get("/blobs/:digest/locations", handler.Wrap(s.getLocationsHandler))
+	r.Get("/blobs/{digest}/locations", handler.Wrap(s.getLocationsHandler))
 
-	r.Post("/namespace/:namespace/blobs/:digest/uploads", handler.Wrap(s.startClusterUploadHandler))
-	r.Patch("/namespace/:namespace/blobs/:digest/uploads/:uid", handler.Wrap(s.patchClusterUploadHandler))
-	r.Put("/namespace/:namespace/blobs/:digest/uploads/:uid", handler.Wrap(s.commitClusterUploadHandler))
+	r.Post("/namespace/{namespace}/blobs/{digest}/uploads", handler.Wrap(s.startClusterUploadHandler))
+	r.Patch("/namespace/{namespace}/blobs/{digest}/uploads/{uid}", handler.Wrap(s.patchClusterUploadHandler))
+	r.Put("/namespace/{namespace}/blobs/{digest}/uploads/{uid}", handler.Wrap(s.commitClusterUploadHandler))
 
-	r.Get("/namespace/:namespace/blobs/:digest", handler.Wrap(s.downloadBlobHandler))
+	r.Get("/namespace/{namespace}/blobs/{digest}", handler.Wrap(s.downloadBlobHandler))
 
-	r.Post("/namespace/:namespace/blobs/:digest/remote/:remote", handler.Wrap(s.replicateToRemoteHandler))
+	r.Post("/namespace/{namespace}/blobs/{digest}/remote/{remote}", handler.Wrap(s.replicateToRemoteHandler))
 
 	r.Post("/forcecleanup", handler.Wrap(s.forceCleanupHandler))
 
 	// Internal endpoints:
 
-	r.Post("/internal/blobs/:digest/uploads", handler.Wrap(s.startTransferHandler))
-	r.Patch("/internal/blobs/:digest/uploads/:uid", handler.Wrap(s.patchTransferHandler))
-	r.Put("/internal/blobs/:digest/uploads/:uid", handler.Wrap(s.commitTransferHandler))
+	r.Post("/internal/blobs/{digest}/uploads", handler.Wrap(s.startTransferHandler))
+	r.Patch("/internal/blobs/{digest}/uploads/{uid}", handler.Wrap(s.patchTransferHandler))
+	r.Put("/internal/blobs/{digest}/uploads/{uid}", handler.Wrap(s.commitTransferHandler))
 
-	r.Delete("/internal/blobs/:digest", handler.Wrap(s.deleteBlobHandler))
+	r.Delete("/internal/blobs/{digest}", handler.Wrap(s.deleteBlobHandler))
 
-	r.Post("/internal/blobs/:digest/metainfo", handler.Wrap(s.overwriteMetaInfoHandler))
+	r.Post("/internal/blobs/{digest}/metainfo", handler.Wrap(s.overwriteMetaInfoHandler))
 
 	r.Get("/internal/peercontext", handler.Wrap(s.getPeerContextHandler))
 
-	r.Head("/internal/namespace/:namespace/blobs/:digest", handler.Wrap(s.statHandler))
+	r.Head("/internal/namespace/{namespace}/blobs/{digest}", handler.Wrap(s.statHandler))
 
-	r.Get("/internal/namespace/:namespace/blobs/:digest/metainfo", handler.Wrap(s.getMetaInfoHandler))
+	r.Get("/internal/namespace/{namespace}/blobs/{digest}/metainfo", handler.Wrap(s.getMetaInfoHandler))
 
 	r.Put(
-		"/internal/duplicate/namespace/:namespace/blobs/:digest/uploads/:uid",
+		"/internal/duplicate/namespace/{namespace}/blobs/{digest}/uploads/{uid}",
 		handler.Wrap(s.duplicateCommitClusterUploadHandler))
 
 	r.Mount("/", http.DefaultServeMux) // Serves /debug/pprof endpoints.
@@ -526,9 +526,6 @@ func (s *Server) commitTransferHandler(w http.ResponseWriter, r *http.Request) e
 	if err != nil {
 		return err
 	}
-	if err := s.uploader.verify(d, uid); err != nil {
-		return err
-	}
 	if err := s.uploader.commit(d, uid); err != nil {
 		return err
 	}
@@ -611,9 +608,6 @@ func (s *Server) commitClusterUploadHandler(w http.ResponseWriter, r *http.Reque
 		return err
 	}
 
-	if err := s.uploader.verify(d, uid); err != nil {
-		return err
-	}
 	if err := s.uploader.commit(d, uid); err != nil {
 		return s.handleUploadConflict(err, namespace, d)
 	}
@@ -660,9 +654,6 @@ func (s *Server) duplicateCommitClusterUploadHandler(w http.ResponseWriter, r *h
 	}
 	delay := dr.Delay
 
-	if err := s.uploader.verify(d, uid); err != nil {
-		return err
-	}
 	if err := s.uploader.commit(d, uid); err != nil {
 		return err
 	}

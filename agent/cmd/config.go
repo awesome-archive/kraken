@@ -16,6 +16,7 @@ package cmd
 import (
 	"github.com/uber/kraken/agent/agentserver"
 	"github.com/uber/kraken/core"
+	"github.com/uber/kraken/lib/dockerdaemon"
 	"github.com/uber/kraken/lib/dockerregistry"
 	"github.com/uber/kraken/lib/store"
 	"github.com/uber/kraken/lib/torrent/networkevent"
@@ -43,4 +44,6 @@ type Config struct {
 	RegistryBackup  string                         `yaml:"registry_backup"`
 	Nginx           nginx.Config                   `yaml:"nginx"`
 	TLS             httputil.TLSConfig             `yaml:"tls"`
+	AllowedCidrs    []string                       `yaml:"allowed_cidrs"`
+	DockerDaemon    dockerdaemon.Config            `yaml:"docker_daemon"`
 }

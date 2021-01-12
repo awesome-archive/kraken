@@ -14,6 +14,8 @@
 package dockerregistry
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -23,7 +25,6 @@ import (
 	"github.com/uber/kraken/lib/dockerregistry/transfer"
 	"github.com/uber/kraken/lib/store"
 
-	"github.com/docker/distribution/context"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
 )
 
@@ -63,13 +64,7 @@ func (b *blobs) stat(ctx context.Context, path string) (storagedriver.FileInfo, 
 	}
 	bi, err := b.transferer.Stat(repo, digest)
 	if err != nil {
-		if err == transfer.ErrBlobNotFound {
-			return nil, storagedriver.PathNotFoundError{
-				DriverName: "kraken",
-				Path:       digest.Hex(),
-			}
-		}
-		return nil, fmt.Errorf("transferer stat: %s", err)
+		return nil, fmt.Errorf("transferer stat: %w", err)
 	}
 	// Hacking the path, since kraken storage driver is also the consumer of this info.
 	// Instead of the relative path from root that docker registry expected, just use content hash.
@@ -111,13 +106,7 @@ func (b *blobs) getCacheReaderHelper(
 
 	r, err := b.transferer.Download(repo, digest)
 	if err != nil {
-		if err == transfer.ErrBlobNotFound {
-			return nil, storagedriver.PathNotFoundError{
-				DriverName: "kraken",
-				Path:       digest.Hex(),
-			}
-		}
-		return nil, fmt.Errorf("transferer download: %s", err)
+		return nil, fmt.Errorf("transferer download: %w", err)
 	}
 
 	if _, err := r.Seek(offset, 0); err != nil {
@@ -127,9 +116,12 @@ func (b *blobs) getCacheReaderHelper(
 }
 
 func parseRepo(ctx context.Context) (string, error) {
-	repo := context.GetStringValue(ctx, "vars.name")
+	repo, ok := ctx.Value("vars.name").(string)
+	if !ok {
+		return "", errors.New("could not parse vars.name from context")
+	}
 	if repo == "" {
-		return "", fmt.Errorf("Failed to parse context for repo name")
+		return "", errors.New("vars.name is empty")
 	}
 	return repo, nil
 }
